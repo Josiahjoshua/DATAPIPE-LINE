@@ -4,8 +4,12 @@ from datetime import datetime, timedelta
 import os
 import pandas as pd
 import pydicom
-from PIL import Image
 import pickle
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+import cv2
 
 # Define default arguments
 default_args = {
@@ -28,26 +32,41 @@ dag = DAG(
 
 image_dir = '/path/to/images'  # Adjust path if necessary
 demographic_file = '/path/to/demographic_data.csv'  # Adjust path if necessary
+model_path = 'E:/Model_output/AfyaAI_model_Resnet50.keras'  # Path to your trained model
 
+# Load the trained model
+def load_model_task():
+    model = load_model(model_path)
+    return model
+
+# Load images and preprocess them
 def load_images(image_dir):
     images = []
     for filename in os.listdir(image_dir):
         if filename.endswith('.dcm'):
             ds = pydicom.dcmread(os.path.join(image_dir, filename))
-            images.append({'filename': filename, 'image': ds.pixel_array, 'type': 'dcm'})
+            img_array = ds.pixel_array
+            img_array = cv2.resize(img_array, (50, 50))
+            img_array = np.stack((img_array,)*3, axis=-1)  # Convert to 3 channels
+            img_array = img_array / 255.0  # Normalize pixel values
+            images.append({'filename': filename, 'image': img_array, 'type': 'dcm'})
         else:
-            # Log or print a message indicating the file is being skipped
             print(f"Skipping non-DICOM file: {filename}")
     return images
 
-def classify_images(images):
+# Classify images using the model
+def classify_images(images, model):
     for img in images:
         if img['type'] == 'dcm':
+            img_batch = np.expand_dims(img['image'], axis=0)
+            predictions = model.predict(img_batch)
+            img['prediction'] = predictions[0].argmax()
             img['category'] = 'mammogram'
         else:
             img['category'] = 'other'
     return images
 
+# Merge image data with demographic data
 def merge_data(images, demographic_data):
     merged_data = []
     for img in images:
@@ -58,9 +77,30 @@ def merge_data(images, demographic_data):
             merged_data.append(data)
     return merged_data
 
+# Save the processed data
 def save_processed_data(merged_data):
     with open('processed_data.pkl', 'wb') as f:
         pickle.dump(merged_data, f)
+
+# Retrain the model with new images and labels
+def retrain_model(images, labels):
+    model = load_model(model_path)
+
+    # Convert images and labels to numpy arrays
+    images = np.array([img['image'] for img in images])
+    labels = np.array(labels)
+
+    # One-hot encode the labels if needed
+    labels = tf.keras.utils.to_categorical(labels, num_classes=2)
+
+    # Define the training process
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    model.fit(images, labels, epochs=10, batch_size=32, validation_split=0.25)
+
+    # Save the retrained model
+    model.save(model_path)
+
+    return model
 
 def task_load_images():
     images = load_images(image_dir)
@@ -68,7 +108,8 @@ def task_load_images():
 
 def task_classify_images(**context):
     images = context['task_instance'].xcom_pull(task_ids='load_images')
-    classified_images = classify_images(images)
+    model = context['task_instance'].xcom_pull(task_ids='load_model_task')
+    classified_images = classify_images(images, model)
     return classified_images
 
 def task_merge_data(**context):
@@ -81,7 +122,19 @@ def task_save_processed_data(**context):
     merged_data = context['task_instance'].xcom_pull(task_ids='merge_data')
     save_processed_data(merged_data)
 
+def task_retrain_model(**context):
+    images = context['task_instance'].xcom_pull(task_ids='load_images')
+    labels = context['task_instance'].xcom_pull(task_ids='load_labels')  # Assuming you have a load_labels task
+    retrained_model = retrain_model(images, labels)
+    return retrained_model
+
 # Define tasks
+t0 = PythonOperator(
+    task_id='load_model_task',
+    python_callable=load_model_task,
+    dag=dag,
+)
+
 t1 = PythonOperator(
     task_id='load_images',
     python_callable=task_load_images,
@@ -109,5 +162,12 @@ t4 = PythonOperator(
     dag=dag,
 )
 
+t5 = PythonOperator(
+    task_id='retrain_model',
+    python_callable=task_retrain_model,
+    provide_context=True,
+    dag=dag,
+)
+
 # Set task dependencies
-t1 >> t2 >> t3 >> t4
+t0 >> t1 >> t2 >> t3 >> t4 >> t5
